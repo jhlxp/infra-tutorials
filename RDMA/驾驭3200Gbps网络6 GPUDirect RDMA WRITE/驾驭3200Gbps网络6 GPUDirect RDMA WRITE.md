@@ -1,13 +1,3 @@
----
-id: "15591466384"
-title: "驾驭3200Gbps网络(6): GPUDirect RDMA WRITE"
-author: "陈乐群"
-type: zhihu-article
-source: "https://zhuanlan.zhihu.com/p/15591466384"
-created: "2024-12-31 08:34"
-updated: "2024-12-31 08:34"
-downloaded: "2026-07-01"
----
 在[上一章](https://zhuanlan.zhihu.com/p/15369995657)中，我们实现了双向的 `RECV` 和 `SEND`，这两个操作都是双侧 RDMA 操作（Two-sided RDMA）。在本章中，我们将拓展上一章的程序，实现 `WRITE`，即直接写入远端的内存。`WRITE` 是一个单侧 RDMA 操作（One-sided RDMA），无需远端 CPU 的参与。在本章中，我们直接写入到 GPU 的内存。因为从 `libfabric` API 的角度来看，写入到宿主机内存和写到显存是一样的，所以如果读者的需求是写入到宿主机内存，只需要将显存的地址转换为宿主机内存的地址即可。我们把本章的程序命名为 `6_write.cpp`。
 
 ## 业务逻辑

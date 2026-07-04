@@ -1,13 +1,3 @@
----
-id: "14933249086"
-title: "驾驭3200Gbps网络(3): libfabric"
-author: "陈乐群"
-type: zhihu-article
-source: "https://zhuanlan.zhihu.com/p/14933249086"
-created: "2024-12-27 08:08"
-updated: "2024-12-27 08:08"
-downloaded: "2026-07-01"
----
 `libfabric` 是一套通用的高性能网络接口，它的风格与前文提到的 RDMA ibverbs 接口十分相像，但是更易用一点。应用程序只需要调用 `libfabric` 的上层接口，而具体的协议由不同的 Provider 实现。`libfabric` 官方的 Provider 包括了 `tcp`、`udp`、`shm`（共享内存）、`verbs`（即 RDMA `ibverbs`）以及对本文来说最重要的 `efa`。
 
 ## 概念及术语

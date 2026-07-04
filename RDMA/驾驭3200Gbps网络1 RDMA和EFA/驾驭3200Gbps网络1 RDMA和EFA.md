@@ -1,13 +1,3 @@
----
-id: "14932656965"
-title: "驾驭3200Gbps网络(1): RDMA和EFA"
-author: "陈乐群"
-type: zhihu-article
-source: "https://zhuanlan.zhihu.com/p/14932656965"
-created: "2024-12-27 07:45"
-updated: "2024-12-27 07:45"
-downloaded: "2026-07-01"
----
 在开始写代码操作 3200 Gbps 网络之前，让我们先了解一下驱动这个高性能网络所需要的硬件、软件以及系统设计哲学。
 
 ## RDMA
