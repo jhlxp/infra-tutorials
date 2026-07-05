@@ -63,7 +63,7 @@ $$
 大多数神经网络 FLOPs 估算都绕不开矩阵乘法。设输入矩阵为：
 
 $$
-X \in \mathbb{R}^{m \times h}
+X \in \mathbb{R}^{N \times h}
 $$
 
 权重矩阵为：
@@ -75,22 +75,44 @@ $$
 输出为：
 
 $$
-Y = XW,\quad Y \in \mathbb{R}^{m \times o}
+Y = XW,\quad Y \in \mathbb{R}^{N \times o}
 $$
 
-输出矩阵的每个元素需要 $h$ 次乘法和约 $h$ 次加法，所以总 FLOPs 近似为：
+这里的 $N$ 不是模型参数量，也不是 GPU 数量，而是输入矩阵的行数。在 LLM 中，它通常等于这次送进线性层的 token 向量个数；如果一个 step 的 batch size 为 $B$、序列长度为 $s$，则常见情况下：
 
 $$
-2mho
+N = B \times s
 $$
 
-由于权重参数量为 $ho$，如果记输入行数为 $N$、该层参数量为 $P_{layer}$，也可以写成：
+这一层的参数只来自权重矩阵 $W$，因此该层参数量是：
 
 $$
-FLOPs \approx 2NP_{layer}
+P_{\text{layer}} = h \times o
 $$
 
-这个关系是 LLM 中 $6TP$ 估算的基础。
+注意 $N$ 只是输入 token 数，不属于参数量。
+
+输出矩阵有 $N \times o$ 个元素。每个元素是长度为 $h$ 的点积，需要 $h$ 次乘法和 $h-1$ 次加法，严格 FLOPs 为：
+
+$$
+N \times o \times (2h - 1)
+$$
+
+当 $h$ 很大时，常用近似是：
+
+$$
+2 N h o
+$$
+
+把 $h \times o$ 替换为该层参数量 $P_{\text{layer}}$，就得到：
+
+$$
+FLOPs \approx 2 N P_{\text{layer}}
+$$
+
+直觉上就是：1 个 token 过这一层时，几乎会用到这一层的所有参数；每用一个参数大约对应 1 次乘法和 1 次加法，所以约为 $2P_{\text{layer}}$ FLOPs。$N$ 个 token 一起过这一层，就约为 $2 N P_{\text{layer}}$ FLOPs。
+
+这个关系是 LLM 中 $6TP$ 估算的基础：把所有层的 $P_{\text{layer}}$ 加起来近似得到模型参数量 $P$，把整个训练过程处理的 token 数加起来得到 $T$，则前向传播主项约为 $2TP$。
 
 ## 4. 常见网络层 FLOPs
 
