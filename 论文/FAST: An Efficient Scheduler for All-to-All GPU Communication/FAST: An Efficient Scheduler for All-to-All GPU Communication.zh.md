@@ -4,7 +4,7 @@
 
 - 标题：FAST: An Efficient Scheduler for All-to-All GPU Communication
 - 年份：2026
-- 版本：NSDI 2026（已录用）
+- 版本：NSDI
 - 作者：Yiran Lei、Dongjoo Lee、Liangyu Zhao、Daniar Kurniawan、Chanmyeong Kim、Heetaek Jeong、Changsu Kim、Hyeonseong Choi、Liangcheng Yu、Arvind Krishnamurthy、Justine Sherry、Eriko Nurvitadhi
 - 机构：
   - Carnegie Mellon University：Yiran Lei、Justine Sherry
