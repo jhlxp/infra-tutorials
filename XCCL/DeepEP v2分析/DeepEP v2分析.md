@@ -53,21 +53,23 @@ v2 与 v1 最大的区别在于[通信 buffer](https://zhida.zhihu.com/search?co
 
 ### 3.3 通信大致流程
 
-1.  hybrid\_dispatch：
+#### 3.3.1 hybrid\_dispatch
 
 1.  机间传输：通过 RailTeam 将 token 发送到目标 RdmaRank 的同 NvlRank 下；
 2.  机内转发：通过 LsaTeam 将 token 从当前 NvlRank 发送到目标 NvlRank 下；
 3.  layout 变换：从通信 layout 转换成矩阵 layout；
-4.  1、2 包含在 hybrid\_dispatch kernel 中，3 包含在 dispatch\_copy\_epl kernel 中；
 
-3.  hybrid\_combine：
+其中，第 1、2 步包含在 hybrid\_dispatch kernel 中，第 3 步包含在 dispatch\_copy\_epl kernel 中；
+
+#### 3.3.2 hybrid\_combine
 
 1.  本地规约：token 命中本地多个 expert 时，先进行本地规约，即 local reduce；
 2.  Nvl 规约：token 命中当前 RdmaRank 的多个 NvlRank 时，对多个 NvlRank 的结果进行规约，即 nvl reduce；
 3.  Rdma 规约：token 命中了多个 RdmaRank，对多个 RdmaRank 的结果进行规约，即 rdma reduce；
-4.  1、2 包含在 hybrid\_combine kernel 中，3 包含在 combine\_reduce kernel 中；
 
-5.  通信实现的关键点就在于数据在多次转发过程中，怎么保存 meta 信息，并根据相关信息进行 dispatch 和 combine；
+其中，第 1、2 步包含在 hybrid\_combine kernel 中，第 3 步包含在 combine\_reduce kernel 中；
+
+通信实现的关键点就在于数据在多次转发过程中，怎么保存 meta 信息，并根据相关信息进行 dispatch 和 combine；
 
 DeepEP v2 的核心思路与 HybridEP 类似，但实现上更加完善，支持了前后处理以及确定性推理相关的逻辑；
 
@@ -1804,5 +1806,4 @@ for (int token_idx = global_warp_idx; token_idx < num_combined_tokens; token_idx
 DeepEP 对 scale 的处理，在使用 DeepGemm 进行矩阵计算时是无缝衔接的（DeepGemm 针对 B 卡在 kernel 内部对 SF 进行重排）；
 
 一些别的 B 卡 Gemm 实现可能要求输入的 scale 是重排之后的，这时候可把对 scale 的重排融合到 dispatch\_copy\_epl kernel 里；
-
 
