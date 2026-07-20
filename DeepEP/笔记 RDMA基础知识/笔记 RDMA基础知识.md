@@ -250,7 +250,7 @@ QP 号码 (QPN): 0x9a
 
 | 状态 | 简称 | 描述 | 关键 API |
 | ----- | ----- | ----- | ----- |
-| Reset | INIT | 初始/重置：QP 刚被创建时的状态。 | ibv_create_qp |
+| Reset | RESET | 初始/重置：QP 刚被创建时的状态。 | ibv_create_qp |
 | Init | INIT | 初始化：配置了 QP 的端口、保护域和访问权限。 | ibv_modify_qp (to INIT) |
 | Ready to Receive | RTR | 准备接收：接收方 QP 已经知道对端信息，并准备接收数据。 | ibv_modify_qp (to RTR) |
 | Ready to Send | RTS | 准备发送：QP 已经准备好开始发送数据。 | ibv_modify_qp (to RTS) |
