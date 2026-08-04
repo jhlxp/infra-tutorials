@@ -7,19 +7,19 @@ DeepSeek开源[DeepEP](https://link.zhihu.com/?target=https%3A//github.com/deeps
 
 DeepEP在节点之间通信采用了nvshmem机制, 在节点内通信则采用了IPC机制。不同于传统的 send/receive 和nccl 这类对称通信， nvshmem和IPC都属于是单向操作，以及为了提升通信效率，DeepEP使用了大量基于显存一致性的无锁同步机制，和大量的数据结构来支持通信过程中的数据交互，再加上cuda代码天然并发， 导致DeepEP的理解成本较高。本文主要聚焦在DeepEP internode\_dispatch的相关代码逻辑，期望通过本文的分析，能够对[deepseek v3技术文档](https://link.zhihu.com/?target=https%3A//arxiv.org/pdf/2412.19437) 中提到的诸如分配20个sm用于通信，为了减小延迟会在rdma收到信息后马上通过nvlink发送到对应的专家上，以及使用了ptx指令来穿透L2缓存使用等技巧有所理解，对cuda和ptx的编程特性有所了解。
 
-## 准备阶段
+## 1 准备阶段
 
-### 构建数据
+### 1.1 构建数据
 
 在tests/test\_internode.py test\_main函数中 line-16
 
-```text
+```python
 num_tokens, hidden, num_topk_groups, num_topk, num_experts = 4096, 7168, min(num_nodes, 4), 8, (256 // num_ranks) * num_ranks
 ```
 
 后续基于如下参数讨论
 
-```text
+```python
 num_tokens=4096 # (token数量), 
 hidden=7168 #（隐层大小）, 
 num_topk_groups=4 #（token发给4台机器， Deepseek V3技术文档中提到为了减小通信，token只会发送到最多4台机器上）, 
@@ -37,7 +37,7 @@ rank= node*8 + local_rank (当前显卡在64张显卡的位置)
 
 line 22 - 37 是每个rank上要dispatch的信息（x, x\_scale, score，topk\_idx, rank\_idx, rdma\_idx ...）， 参考相应注释，在注释中标注了各个tensor的维度信息和含义。
 
-```text
+```python
 x = torch.ones((num_tokens, hidden), dtype=torch.bfloat16, device='cuda') * rank 
 #[4096, 7168] bfloat16
 
@@ -95,7 +95,7 @@ num_rdma_token_sent = rdma_idx.ne(-1).sum().item()
 
 一些dispatch对应的统计信息
 
-```text
+```python
 # Expert meta
 num_tokens_per_expert = torch.zeros((num_experts, ), dtype=torch.int, device='cuda') #[256]
 for i in range(num_experts):
@@ -130,7 +130,7 @@ dist.all_reduce(gbl_num_tokens_per_rank, group=group) #计算整个world需要�
 
 简单的来看，是可以通过score得到token要发送到哪里（expert, rank, rdma\_rank）， 发送量由多少。 而后通过这些信息，做下全局同步，就可以得到每个显卡会收到多少token, 来自哪里这些基础信息，方便后续分配显存接受数据和计算。
 
-### 构建通信环境
+### 1.2 构建通信环境
 
 ![图2 初始化ipc通信和nvshmem通信环境](images/002.jpg)
 
@@ -138,7 +138,7 @@ dist.all_reduce(gbl_num_tokens_per_rank, group=group) #计算整个world需要�
 
 在tests/test\_internode.py test\_loop函数line 223
 
-```text
+```python
 rank, num_ranks, group = init_dist(local_rank, num_local_ranks)
 ```
 
@@ -146,14 +146,14 @@ rank, num_ranks, group = init_dist(local_rank, num_local_ranks)
 
 而后在line 228 调用 deep\_ep.Buffer
 
-```text
+```python
 buffer = deep_ep.Buffer(group, int(1e9), int(1e9), low_latency_mode=test_ll_compatibility,
                             num_qps_per_rank=(ll_num_experts // num_ranks if test_ll_compatibility else 1))
 ```
 
 deep\_ep.Buffer 在deep\_ep/buffer.py line32 \_\_init\_\_ 函数。在其函数内，在line 55进入到c++代码
 
-```text
+```python
 self.runtime = deep_ep_cpp.Buffer(self.rank, self.group_size, num_nvl_bytes, num_rdma_bytes, low_latency_mode)
 ```
 
@@ -161,7 +161,7 @@ deep\_ep\_cpp.Buffer 在 csrc/deep\_ep.cpp line 16 Buffer::Buffer 构造函数�
 
 在Buffer::Buffer中，主要是构造了用来节点内通信的buffer\_ptrs（通过ipc通信）， 以及用来记录接受token数量的一些变量。在line 43 - 55.
 
-```text
+```cpp
 if (num_nvl_bytes > 0) {
     // Local IPC: alloc local memory and set local IPC handle
     //buffer_ptrs是一个数组，buffer_ptrs[nvl_rank]指向自身显卡的显存，
@@ -183,7 +183,7 @@ if (num_nvl_bytes > 0) {
 
 在python代码deep\_ep/buffer.py \_\_init\_\_ 函数内 line 94 调用了self.runtime.sync完成ipc显存指向和rdma显存的分配
 
-```text
+```python
 self.runtime.sync(device_ids, ipc_handles, root_unique_id)
 ```
 
@@ -191,7 +191,7 @@ self.runtime.sync(device_ids, ipc_handles, root_unique_id)
 
 line 169 -189 完成ipc显存映射
 
-```text
+```cpp
 // Sync IPC handles
 if (num_nvl_bytes > 0) {
     EP_HOST_ASSERT(num_ranks == device_ids.size());
@@ -225,7 +225,7 @@ if (num_nvl_bytes > 0) {
 
 在line192 -212完成rdma组构建和rdma显存分配
 
-```text
+```cpp
 // Sync NVSHMEM handles and allocate memory
 if (num_rdma_bytes > 0) {
     // Initialize NVSHMEM
@@ -254,7 +254,7 @@ if (num_rdma_bytes > 0) {
 
 internode::init 在 csrc/kernel/runtime.cu line 65 init 函数， 主要代码是在line 66 - 70
 
-```text
+```cpp
 nvshmemx_uniqueid_t root_unique_id;
 nvshmemx_init_attr_t attr;
 std::memcpy(&root_unique_id, root_unique_id_val.data(), sizeof(nvshmemx_uniqueid_t));
@@ -268,7 +268,7 @@ nvshmemx_init_attr(NVSHMEMX_INIT_WITH_UNIQUEID, &attr);
 
 internode::alloc在 csrc/kernel/runtime.cu line 98.
 
-```text
+```cpp
 nvshmem_align(alignment, size);
 ```
 
@@ -284,11 +284,11 @@ nvshmem_align(alignment, size);
 
 图5描述了internode token分发的主要代码逻辑，大概的流程是nofify\_dispatch, 分配接受显存，dispatch。 notify\_dispatch和dispatch都进入到cuda kernel代码在gpu上完成。 c++侧代码主要是统计一些辅助信息和分配一些显存用于通信，主要通信逻辑封装在 notify\_dispatch<> 和 dispatch<> 两个kernel函数中。 nofiy\_dispatch在统计全局的token分发， dispatch是真正的用rdma发送token和消费转发远端发送来的token。 后续主要介绍这两个函数的相关逻辑。
 
-## notify\_dispatch
+## 2 notify\_dispatch
 
 在csrc/kernels/internode.cu line 201, 各参数含义参见注释
 
-```text
+```cpp
 notify_dispatch(
 const int* num_tokens_per_rank,  #(int)[64] 在第一步构建数据时统计了要发到各rank的token数量
 int* moe_recv_counter_mapped, #(int)[1] 该节点最终会收到的token数，用于分配 recv_x 显存
@@ -331,20 +331,20 @@ num_rdma_experts: 单个rdma（某台机器）上的的expert个数， 32
 num_nvl_experts: 单个显卡上的expert个数， 4
 ```
 
-### SM0 rdma通信和ipc通信
+### 2.1 SM0 rdma通信和ipc通信
 
 SM0 利用rdma通信和ipc通信， 获取各rank发送到自身的token数据， 和发送到当前节点各expert的token数
 
 sm0用于远端通信， 在line 224-225, 使用 第0个sm的第32个线程（warp1）来做全局nvshemem同步， 只有rdma 组的8个成员都到达才会继续往下执行。
 
-```text
+```cpp
 if (thread_id == 32) # line 224, 
    nvshmem_barrier_with_same_gpu_idx<kLowLatencyMode>(rdma_team); // rdma team同步
 ```
 
 在line 226 使用线程0-7做本机同步 barrier\_device函数 使用了ipc操作，参见注释。
 
-```text
+```cpp
 barrier_device<NUM_MAX_NVL_PEERS>(task_fifo_ptrs, head, nvl_rank); #line 226
 
 __device__ void
@@ -366,13 +366,13 @@ barrier_device(int **task_fifo_ptrs, int head, int rank, int tag = 0) {
 
 line 228 同步sm 0下的所有线程， 256个线程都到达后才会继续往下执行
 
-```text
+```cpp
 __syncthreads() ; #line 228, block threads 同步 
 ```
 
 line232 构建了一个symBuffer用于rdma通信
 
-```text
+```cpp
 auto rdma_recv_num_tokens_mixed = SymBuffer<int>(rdma_buffer_ptr, NUM_MAX_NVL_PEERS + num_rdma_experts + 1, kNumRDMARanks);
 ```
 
@@ -382,7 +382,7 @@ auto rdma_recv_num_tokens_mixed = SymBuffer<int>(rdma_buffer_ptr, NUM_MAX_NVL_PE
 
 在line 242 ~ 248 就是统计send\_ptr的信息(64个rank, 256个expert, 8个rdma\_rank)
 
-```text
+```cpp
 for (int i = thread_id; i < num_ranks; i += num_threads) #line 242 ， num_ranks=64
     rdma_recv_num_tokens_mixed.send_buffer(i / NUM_MAX_NVL_PEERS)[i % NUM_MAX_NVL_PEERS] = num_tokens_per_rank[i];
     // i / NUM_MAX_NVL_PEERS 对应的rdma_rank, i % NUM_MAX_NVL_PEERS对应的nvl_rank
@@ -396,7 +396,7 @@ if (thread_id < kNumRDMARanks) // kNumRDMARanks=8
 
 在line 254 ~ 255 将本节点的信息发送到远端rdma 0 ~ 7
 
-```text
+```cpp
 if (thread_id < kNumRDMARanks) { #line 254 thread 0 - 7
             nvshmem_int_put_nbi(rdma_recv_num_tokens_mixed.recv_buffer(rdma_rank), rdma_recv_num_tokens_mixed.send_buffer(thread_id),
                                 NUM_MAX_NVL_PEERS + num_rdma_experts + 1,
@@ -408,7 +408,7 @@ if (thread_id < kNumRDMARanks) { #line 254 thread 0 - 7
 
 而后在 line 261通过 nvshmem\_barrier 等待nvshmem通信完成
 
-```text
+```cpp
 if (thread_id == 0)
     nvshmem_barrier_with_same_gpu_idx<kLowLatencyMode>(rdma_team); #line 261
 __syncthreads();
@@ -422,7 +422,7 @@ __syncthreads();
 
 在line265 - 271构建了用于nvl 通信的数据结构， 数据结构如图8所示。
 
-```text
+```cpp
 // NVL buffers
 // thread_id 0-7 对应本rdma_rank上的8个nvl_rank
 auto nvl_send_buffer = thread_id < NUM_MAX_NVL_PEERS ? buffer_ptrs[thread_id] : nullptr; #line 265
@@ -441,7 +441,7 @@ auto nvl_recv_num_tokens_per_expert = AsymBuffer<int>(nvl_recv_buffer, num_nvl_e
 
 在line 284 - 290, 统计本rank节点中要发送给本节点rdma\_rank 32 个expert的数据。
 
-```text
+```cpp
 if (thread_id < num_rdma_experts) { # line 284, thread id 0-31
     int sum = 0;
     #pragma unroll
@@ -453,7 +453,7 @@ if (thread_id < num_rdma_experts) { # line 284, thread id 0-31
 
 在line294 - 303中，统计累加各rdma发送到本rdma\_rank的数据量， 存储在recv\_rdma\_rank\_prefix\_sum中（(int)\[8\]）, 总量写入moe\_recv\_rdma\_counter\_mapped （mapped memory, cpu/gpu代码都可以访问）
 
-```text
+```cpp
 if (thread_id == 0) { #line 294
     int sum = 0;
     #pragma unroll
@@ -468,7 +468,7 @@ if (thread_id == 0) { #line 294
 
 在line 307 - 314 中， 通过ipc，写入 nvl\_send\_num\_tokens\_per\_rank 从nvl\_rank(本节点) 所对应的rdma\_rank 要发送到目标rank节点上的token数, 写入 nvl\_send\_num\_tokens\_per\_expert从nvl\_rank(本节点）所对应的rdma\_rank 要发送到目标rank节点expert的token数。
 
-```text
+```cpp
 if (thread_id < NUM_MAX_NVL_PEERS) { #line 307 thread 0 - 7
     #pragma unroll
     for (int i = 0; i < kNumRDMARanks; ++ i)
@@ -485,7 +485,7 @@ if (thread_id < NUM_MAX_NVL_PEERS) { #line 307 thread 0 - 7
 
 在line 323 - 332 汇总统计world rank 发送给自己节点的token数，并将总量存入到moe\_recv\_counter\_mapped（供后续 recv\_x分配内存）
 
-```text
+```cpp
 if (thread_id == 0) {
     int sum = 0;
     #pragma unroll
@@ -501,7 +501,7 @@ if (thread_id == 0) {
 
 在line 334-342 统计发送到各expert的数据量
 
-```text
+```cpp
 if (thread_id < num_nvl_experts) {  #num_nvl_experts = 4
     int sum = 0;
     #pragma unroll
@@ -518,7 +518,7 @@ if (thread_id < num_nvl_experts) {  #num_nvl_experts = 4
 
 接着分析sm1-sm8的相关工作
 
-### SM 1-8 计算节点各通道发送token数据到各rank和rdma组的情况
+### 2.2 SM 1-8 计算节点各通道发送token数据到各rank和rdma组的情况
 
 在notify\_dispatch中启用了9个 SM block计算, SM 0用rdma通信和ipc通信来统计要接受和发送的信息。sm 1- 8则统计channel（通道）粒度的内容。
 
@@ -530,13 +530,13 @@ if (thread_id < num_nvl_experts) {  #num_nvl_experts = 4
 
 line 352做了简单处理，将sm\_id从1-8映射到0-7
 
-```text
+```cpp
 int dst_rdma_rank = sm_id - 1;  //line 352
 ```
 
 line 353 - 382 是将token切分成10个通道，每个通道统计发送到远端rank和rdma\_rank的数据量， 为了简洁性，做了代码缩减, 代码逻辑参见注释。
 
-```text
+```cpp
 for (int channel_id = warp_id; channel_id < num_channels; channel_id += num_warps) { # line 353
     //每个warp处理一个channel
     ...
@@ -580,7 +580,7 @@ rdma\_channel\_prefix\_matrix矩阵大小\[8, 10\], gbl\_channel\_prefix\_matrix
 
 line 387 - 400 是rdma\_channel\_prefix\_matrix和gbl\_channel\_prefix\_matrix按channel维度累加的数据，代表了channel信息在远端的结束地址。
 
-```text
+```cpp
 if (thread_id == 0) { #line387, 这行代码早期是有问题的，后面在repo中被修正了
     //rdma_channel_prefix_matrix[8,10], 每个sm处理一行
     auto prefix_row = rdma_channel_prefix_matrix + dst_rdma_rank * num_channels;
@@ -601,11 +601,26 @@ if (thread_id < NUM_MAX_NVL_PEERS) {
 
 到此， notify\_dispatch的工作完成， 在host cpu侧代码会基于 mapping内存moe\_recv\_counter得到节点接受的token数量，然后基于这个token数量分配recv\_x的内存, 而后开始internode\_dispatch工作。 从上面代码逻辑来看， notify就是在登记各种token的发送/接受信息， 是一个比较轻量级的任务。
 
-## dispatch
+### 2.3 notify\_dispatch 小结
+
+`notify_dispatch` 不搬运 token 的实际 payload，核心目标是为后续 `dispatch` kernel 建好通信账本：每个 rank/RDMA rank/expert 会收多少 token、这些 token 在接收 buffer 中的连续区间在哪里、每个 channel 负责哪一段发送任务。
+
+| 阶段 | 主要工作 | 关键产物 | 给后续 dispatch 的作用 |
+| --- | --- | --- | --- |
+| 通信同步 | 通过 NVSHMEM 做 RDMA group 同步，通过 IPC buffer 做节点内 peer 同步 | 同步后的 RDMA/NVL 可见状态 | 确保各 rank 后续读写共享元数据时看到一致状态 |
+| 全局计数交换 | 将本 rank 发往各 RDMA rank、global rank、expert 的 token count 写到远端/节点内 buffer | `rdma_recv_num_tokens_mixed`、`nvl_send_num_tokens_per_rank`、`nvl_send_num_tokens_per_expert` | 让当前 rank 获得“谁会给我发多少”的全局视图 |
+| 接收规模统计 | 汇总当前 rank、当前 RDMA rank、本地 experts 的接收 token 数 | `moe_recv_counter_mapped`、`moe_recv_rdma_counter_mapped`、`moe_recv_expert_counter_mapped` | Host 侧据此分配 `recv_x` 等接收 tensor |
+| 接收区间规划 | 对来自不同 RDMA rank / global rank 的 token 数做 prefix sum | `recv_rdma_rank_prefix_sum`、`recv_gbl_rank_prefix_sum` | 确定不同来源 token 在输出中的连续地址区间 |
+| channel 任务切分 | 将 token 按 channel 切分，统计每个 channel 发往各 RDMA rank / global rank 的数量 | `rdma_channel_prefix_matrix`、`gbl_channel_prefix_matrix` | 让 `dispatch` 多个 SM/channel 可以并行发送、转发和接收 |
+| 元数据清理 | 清理 RDMA/NVL buffer 中本轮会复用的 head/tail/meta 区域 | 清零后的通信控制区 | 避免上一轮通信残留影响本轮判断 |
+
+简单来说，`notify_dispatch` 做的是 **元数据通信和布局规划**；`dispatch` 才开始做 **token 数据搬运和转发**。
+
+## 3 dispatch
 
 在 csrc/kernels/internode.cu line 457 dispatch函数进入到对应的gpu代码。需要注意的是dispatch 函数使用了 \_\_launch\_bounds\_\_(16 \* 32, 1)修饰
 
-```text
+```cpp
 __global__ void __launch_bounds__(((kNumDispatchRDMASenderWarps + 1 + NUM_MAX_NVL_PEERS) * 32), 1)
 dispatch(...)
 ```
@@ -618,13 +633,13 @@ dispatch(...)
 
 line 1066 启动时block=20, threads=512
 
-```text
+```cpp
 SETUP_LAUNCH_CONFIG(num_channels * 2, (kNumDispatchRDMASenderWarps + 1 + NUM_MAX_NVL_PEERS) * 32, stream); 
 ```
 
 在line 457 - 467 对应的参数含义如下
 
-```text
+```cpp
 dispatch(
    int4* recv_x,  // [m, 7168]，用于接受发送到本节点的token, 给后续的expert层计算, m来自由notify_dispatch moe_recv_counter
    float* recv_x_scales,  // [m,56]
@@ -689,7 +704,7 @@ topk_weight: 8 * 4 = 32
 
 line 508-512 构建了rdma的数据结构，用来后续的rdma写入和通信
 
-```text
+```cpp
 auto rdma_channel_data = SymBuffer<int8_t>(rdma_buffer_ptr, num_max_rdma_chunked_recv_tokens * num_bytes_per_rdma_token, kNumRDMARanks, channel_id, num_channels);
 auto rdma_channel_meta = SymBuffer<int>(rdma_buffer_ptr, NUM_MAX_NVL_PEERS * 2 + 2, kNumRDMARanks, channel_id, num_channels);
 auto rdma_channel_head = SymBuffer<uint64_t, false>(rdma_buffer_ptr, 1, kNumRDMARanks, channel_id, num_channels);
@@ -698,7 +713,7 @@ auto rdma_channel_tail = SymBuffer<uint64_t, false>(rdma_buffer_ptr, 1, kNumRDMA
 
 在line 516-521 基于wapr的角色（参考图10）是kRDMAAndNVLForwarder（从rdma接受缓存写入到nvl缓存）， kNVLReceivers（从nvl缓存写入到recv\_x中）决定 rs\_wr\_buffer\_ptr 以及 ws\_rr\_buffer\_ptr指向的是自己节点的缓存还是ipc的缓存。
 
-```text
+```cpp
  void *rs_wr_buffer_ptr = nullptr, *ws_rr_buffer_ptr = nullptr;
  int rs_wr_rank = 0, ws_rr_rank = 0;
  if (warp_role == WarpRole::kRDMAAndNVLForwarder)
@@ -709,7 +724,7 @@ auto rdma_channel_tail = SymBuffer<uint64_t, false>(rdma_buffer_ptr, 1, kNumRDMA
 
 在line523-532 分配了缓存的数据结构供后续缓存操作代码使用
 
-```text
+```cpp
 // Allocate buffers
 auto nvl_channel_x = AsymBuffer<int4>(ws_rr_buffer_ptr, num_max_nvl_chunked_recv_tokens * hidden_int4, NUM_MAX_NVL_PEERS, channel_id, num_channels, rs_wr_rank).advance_also(rs_wr_buffer_ptr);
 auto nvl_channel_src_meta = AsymBuffer<SourceMeta>(ws_rr_buffer_ptr, num_max_nvl_chunked_recv_tokens, NUM_MAX_NVL_PEERS, channel_id, num_channels, rs_wr_rank).advance_also(rs_wr_buffer_ptr);
@@ -726,18 +741,18 @@ auto nvl_channel_tail = AsymBuffer<int>(ws_rr_buffer_ptr, 1, NUM_MAX_NVL_PEERS, 
 
 如图12和图13所示，操作待后续对照代码解释。
 
-### kRDMASender， 填充rdma发送缓存
+### 3.1 kRDMASender， 填充rdma发送缓存
 
 在line 547- 548， 主要是获取当前通道（sm）要处理的数据的起始地址和结束地址
 
-```text
+```cpp
 int token_start_idx, token_end_idx; #line547
 get_channel_task_range(num_tokens, num_channels, channel_id, token_start_idx, token_end_idx);
 ```
 
 line 552-554, 是共享变量初始化用于后续数据填充，只用了warp 0 来操作。
 
-```text
+```cpp
 (warp_id == 0 and lane_id == 0) ? (rdma_send_next_token_idx = token_start_idx) : 0;
 //rdma_send_channel_tail[7]
 (warp_id == 0 and lane_id < kNumRDMARanks) ? (rdma_send_channel_tail[lane_id] = 0) : 0;
@@ -747,7 +762,7 @@ line 552-554, 是共享变量初始化用于后续数据填充，只用了warp 0
 
 在line 558 - 567中， 用于填充rdma\_channel\_meta.send\_buffer本节点发送到远端rank, rdma\_rank的起始index和结束index。
 
-```text
+```cpp
 for (int dst_rdma_rank = warp_id; dst_rdma_rank < kNumRDMARanks; dst_rdma_rank += kNumDispatchRDMASenderWarps) {
    if (lane_id < NUM_MAX_NVL_PEERS) {
        rdma_channel_meta.send_buffer(dst_rdma_rank)[lane_id] = -(channel_id == 0 ? 0 : gbl_channel_prefix_matrix[(dst_rdma_rank * NUM_MAX_NVL_PEERS + lane_id) * num_channels + channel_id - 1]) - 1;
@@ -768,7 +783,7 @@ rdma\_channel\_meta.send\_buffer的含义如图所示，一共有8个warp, 每�
 
 line 568 通过nvshmem发送send\_buffer到远端rdma\_rank节点
 
-```text
+```cpp
 nvshmemx_int_put_nbi_warp(rdma_channel_meta.recv_buffer(rdma_rank), #远端rdma_rank接受
 rdma_channel_meta.send_buffer(dst_rdma_rank), #当前节点发送
 NUM_MAX_NVL_PEERS * 2 + 2, # 发送字节数                                     
@@ -779,19 +794,19 @@ nvshmemx\_int\_put\_nbi\_warp是一个warp级别函数，需要当前warp全部�
 
 line 572 用于同步 kRDMASender和kRDMASenderCoordinator
 
-```text
+```cpp
 sync_rdma_sender_smem();# 需要8个warp 256个线程都参与后开始下一步
 ```
 
 line 577设定填充的send buffer, 如果是给节点本身，则直接设置recv\_buffer为send\_buffer
 
-```text
+```cpp
 auto send_buffer = lane_id == rdma_rank ? rdma_channel_data.recv_buffer(lane_id) : rdma_channel_data.send_buffer(lane_id);
 ```
 
 在line 508-604是逐条处理要发送的token, 填充到rdma的发送缓存，**使用自旋锁来同步warp直间的顺序操作**
 
-```text
+```cpp
 for (token_idx = token_start_idx + warp_id; token_idx < token_end_idx; token_idx += kNumDispatchRDMASenderWarps) {
    // 依序每个warp处理一条数据
    // Read RDMA rank existence
@@ -818,7 +833,7 @@ for (token_idx = token_start_idx + warp_id; token_idx < token_end_idx; token_idx
 
 在line 588 - 595 是
 
-```text
+```cpp
 // Acquire next tail
 int rdma_tail_idx = -1;
 if (is_token_in_rank_uint64 != 0) {
@@ -833,7 +848,7 @@ ld\_volatile\_global(rdma\_channel\_head.buffer(lane\_id)) 对应的ptx指令为
 
 这个值是在 kForwarderCoordinator代码 line929 - 931 通过rdma消息更改，kForwarderCoordinator在kRDMAAndNVLForwarder消费rdma接受缓存后通知远端rdma发送方。
 
-```text
+```cpp
 if (min_head != std::numeric_limits<int>::max() and min_head > last_head and lane_id < kNumRDMARanks)
     nvshmem_uint64_p(rdma_channel_head.buffer(rdma_rank), last_head = min_head,
         translate_dst_rdma_rank<kLowLatencyMode>(lane_id, nvl_rank));
@@ -849,7 +864,7 @@ cached\_rdma\_channel\_head是一个寄存器变量，只有当 rdma\_tail\_idx 
 
 在line 602-604还有一个同步， **用于kRDMASender和kRDMASenderCoordinator内存同步**
 
-```text
+```cpp
 // Update last token tail
 if (last_rdma_tail_idx >= 0)
     st_release_cta(const_cast<const int *>(rdma_send_channel_tail + lane_id), last_rdma_tail_idx + 1);
@@ -860,7 +875,7 @@ st\_release\_cta对应的ptx指令为st.release.cta.s32，将本次操作操作�
 
 因为线程0-7所获取到的rdma\_tail\_idx有差异（有些有需要发，有些不需要发），在后续从x复制数据到rdma send时候是整个warp参与，因此需要一种将0-7rdma\_tail\_idx同步到整个warp的逻辑。line610 - 622 实现将rdma\_tail\_idx转换成slot idx并且同步到整个warp的逻辑。
 
-```text
+```cpp
 SourceMeta src_meta;
 int num_topk_ranks = 0, topk_ranks[kNumTopkRDMARanks];
 void* dst_send_buffers[kNumTopkRDMARanks];
@@ -881,7 +896,7 @@ for (int i = 0, slot_idx; i < kNumRDMARanks; ++ i) if ((slot_idx = __shfl_sync(0
 
 在line 626 - 663开始填充token及相关元素。 line626-line 631 填充x到rdma
 
-```text
+```cpp
 auto st_broadcast = [=](const int key, const int4& value) {
 #pragma unroll
 for (int j = 0; j < num_topk_ranks; ++ j)
@@ -894,7 +909,7 @@ ld\_nc\_global对应的ptx指令为 ld.global.nc.L1::no\_allocate.L2::256B， st
 
 line633-653 是更新写入指针，写入meta, x\_scale, topk\_idx, topk\_weight，参见中文注释
 
-```text
+```cpp
 for (int i = 0; i < num_topk_ranks; ++ i) // line633
     dst_send_buffers[i] = reinterpret_cast<int4*>(dst_send_buffers[i]) + hidden_int4;//更新写入指针
 
@@ -932,18 +947,18 @@ for (int i = lane_id; i < num_topk * num_topk_ranks; i += 32) { //写入topk_idx
 
 至此， kRDMASender主要工作完成。**kRDMASender主要目的是将发送信息x， x\_scale，source\_meta, topk\_idx, topk\_weight等信息填充进入rdma发送缓存，期间要同步warp直接对token的依序操作，以及和kForwarderCoordinator, kRDMASenderCoordinator内存同步。同时在复制操作时， 使用ld.global.nc.L1::no\_allocate.L2::256B， st.global.L1::no\_allocate减少L1/L2缓存使用。**
 
-### kRDMASenderCoordinator， 发送rdma信息
+### 3.2 kRDMASenderCoordinator， 发送rdma信息
 
 kRDMASenderCoordinator主要工作是通过nvshmem将kRDMASender在rdma缓存区填充好的内容发送到远端rdma rank节点去。kRDMASenderCoordinator 和 kRDMASender 分布在同一批sm上。 每个sm上的kRDMASenderCoordinator负责同sm上的kRDMASender的信息发送。kRDMASenderCoordinator起一个warp, 32个线程。32个线程都会参与nvshmem信息发送，主要的信息记录在0-7线程上。
 
-```text
+```cpp
 // Synchronize shared memory
 sync_rdma_sender_smem(); //line 682
 ```
 
 line 682 是 和同sm 的kRDMASender同步，在kRDMASender通过nvshmem发送完每个channel的对应rdma的起始地址和结束地址后，同步， 而后kRDMASender开始填充数据， kRDMASenderCoordinator发送填充的信息。
 
-```text
+```cpp
 int num_tokens_to_send = 0; //line 685
 if (lane_id < kNumRDMARanks) { // 8 个线程
    num_tokens_to_send = rdma_channel_prefix_matrix[lane_id * num_channels + channel_id];
@@ -956,7 +971,7 @@ line685是获得发送到各rdma rank的token数， 有8个rdma节点，使用�
 
 line 694- 733开始数据发送
 
-```text
+```cpp
 while (__any_sync(0xffffffff, num_tokens_to_send > 0)) {
      for (int i = 0, synced_num_tokens_to_send; i < kNumRDMARanks; ++ i) {
 ...
@@ -967,7 +982,7 @@ while (__any_sync(0xffffffff, num_tokens_to_send > 0)) {
 
 line 696 - 699 是如果当前循环对应的远端rdma rank数据已发送完，则继续下一个rdma rank.
 
-```text
+```cpp
 int dst_rdma_rank = (i + channel_id) % kNumRDMARanks; // line 696
 synced_num_tokens_to_send = __shfl_sync(0xffffffff, num_tokens_to_send, dst_rdma_rank);
 if (synced_num_tokens_to_send == 0)
@@ -976,7 +991,7 @@ if (synced_num_tokens_to_send == 0)
 
 line 702-706是在当前的远端rdma rank, 如果需要发送的token大于发送值（num\_max\_rdma\_chunked\_send\_tokens=28）或者需要发送的token数虽然小于28， 但是已经是发送完之后就整体发送结束，则进入发射流程。不然则等待待发送token数累积超过28。为了提升nvshemem的发送效率，减少nvshmem的发送频率，发送的token数需要累积到一定数量才发送。
 
-```text
+```cpp
 auto synced_last_issued_tail = __shfl_sync(0xffffffff, last_issued_tail, dst_rdma_rank);//line 702
 auto processed_tail = ld_acquire_cta(const_cast<const int*>(rdma_send_channel_tail + dst_rdma_rank));
 auto num_tokens_processed = processed_tail - synced_last_issued_tail;
@@ -988,7 +1003,7 @@ ld\_acquire\_cta对应的ptx指令为 ld.acquire.cta.s32， 这个指令是一�
 
 line 709 - 722开始发送，一次发送最多发送28条
 
-```text
+```cpp
 auto num_tokens_to_issue = min(num_tokens_processed, num_max_rdma_chunked_send_tokens);//line709
 EP_DEVICE_ASSERT(num_tokens_to_issue >= 0 and num_tokens_to_issue <= synced_num_tokens_to_send);
 if (dst_rdma_rank != rdma_rank) {
@@ -1009,7 +1024,7 @@ if (dst_rdma_rank != rdma_rank) {
 
 在line 726 - 731做了信息记录
 
-```text
+```cpp
 if (lane_id == dst_rdma_rank) {
   last_issued_tail += num_tokens_to_issue;
   num_tokens_to_send -= num_tokens_to_issue;
@@ -1020,7 +1035,7 @@ if (lane_id == dst_rdma_rank) {
 
 nvshmemx\_signal\_op是一个原子操作，用于更新远端rdma 己方已发送的token数，用于做发送信息同步。
 
-```text
+```cpp
 nvshmemx_int8_put_nbi_warp(...) ; // 发送信息
 nvshmem_fence(); // 内存一致性，保证nvshmemx_int8_put_nbi_warp发生在nvshmemx_signal_op之前
 nvshmemx_signal_op（...);//原子更新
@@ -1030,7 +1045,7 @@ nvshmemx_signal_op（...);//原子更新
 
 至此， kRDMASenderCoordinator完成其信息发送的功能。**kRDMASenderCoordinator使用了同sm内存一致性（ld.acquire.cta.s32）， nvshmem内存一致性（nvshmem\_fence）和原子操作（nvshmemx\_signal\_op），减少硬同步，提升整体效率。**
 
-### kRDMAAndNVLForwarder， 消费rdma接受缓存并存到ipc nvl缓存 。
+### 3.3 kRDMAAndNVLForwarder， 消费rdma接受缓存并存到ipc nvl缓存 。
 
 kRDMAAndNVLForwarder是读取接受的rdma.recv\_buffer，存到ipc nvl缓存中。kRDMAAndNVLForwarder使用了10个sm, 分辨处理远端rdma rank发送到本节点的10个通道数据。 每个sm 8个warp, 分别负责将数据分到对应的8个nvl peer。首先，warp的0-7线程读取对应rdma rank要发送过来的 token 数量num\_tokens\_to\_recv\_from\_rdma，每消费一个token, num\_tokens\_to\_recv\_from\_rdma-=1, 直到8个rdma\_rank的num\_tokens\_to\_recv\_from\_rdma都归0，才结束整体流程。
 
@@ -1038,7 +1053,7 @@ kRDMAAndNVLForwarder是读取接受的rdma.recv\_buffer，存到ipc nvl缓存中
 
 line734 - 739 设定warp对应处理的nvl peer节点。
 
-```text
+```cpp
 const auto dst_nvl_rank = target_rank; //line 736
 const auto dst_rank = rdma_rank * NUM_MAX_NVL_PEERS + dst_nvl_rank;
 const auto dst_rank_expert_begin = dst_rank * (num_experts / num_ranks);
@@ -1049,7 +1064,7 @@ target rank在图12 kRDMAAndNVLForwarder的nvl缓存数据结构有详细描述�
 
 在line 747-766 读取从远端rdma rank 发送过来的token统计信息，rdma\_channel\_meta.recv\_buffer信息是在kRDMASender通过rdma发送过来的该节点起始地址和结束地址信息
 
-```text
+```cpp
 auto meta_0 = ld_volatile_global(rdma_channel_meta.recv_buffer(lane_id) + dst_nvl_rank);
 auto meta_1 = ld_volatile_global(rdma_channel_meta.recv_buffer(lane_id) + NUM_MAX_NVL_PEERS + dst_nvl_rank);
 auto meta_2 = ld_volatile_global(rdma_channel_meta.recv_buffer(lane_id) + NUM_MAX_NVL_PEERS * 2);
@@ -1060,7 +1075,7 @@ meta\_0 是nvl节点的起始地址，meta\_1是nvl节点的结束地址， meta
 
 line 753 - 764 为统计相应信息，计算会接受到的token数量。
 
-```text
+```cpp
 int start_sum = -meta_0 - 1, end_sum = -meta_1 - 1; //line 753
 EP_DEVICE_ASSERT(start_sum >= 0 and end_sum >= 0 and end_sum >= start_sum);
 // 填充信息到nvl_channel_prefix_start，  relax信息可以在后续acquire中可见， 
@@ -1081,7 +1096,7 @@ num\_tokens\_to\_recv\_from\_rdma是远端 $rdma\_rank_i$ 会发送给当前节�
 
 line 790 开始准备处理接受数据，直到所有的数据接受完成。
 
-```text
+```cpp
 while (__any_sync(0xffffffff, num_tokens_to_recv_from_rdma > 0)) { //line 790
    ...
    while (lane_id == 0) {
@@ -1100,7 +1115,7 @@ num\_tokens\_to\_recv\_from\_rdma维护在线程0-7之中，在处理token时，
 
 line810-817 位依次寻找有可消耗rdma接受缓存的信息， 详情参见注释。
 
-```text
+```cpp
 while (true) { //line 810
     src_rdma_rank = (src_rdma_rank + 1) % kNumRDMARanks; //下一个rdma rank
     //还有token待接受
@@ -1123,7 +1138,7 @@ ld\_acquire\_sys\_global，对应的ptx指令为ld.acquire.sys.global.s32，基�
 
 line 830-line 885填充这一个批次的可用数据。首先基于读取到的SourceMeta， 判断token是否会发送给nvl peer is\_in\_dst\_nvl\_rank， 如果不在目标范围，则跳过当前token处理下一条token. 如果在目标范围，则依序复制x,x\_scale, topk\_idx, topk\_weight等信息。填充逻辑在kRDMASender有过讨论，使用整个warp来填充。
 
-```text
+```cpp
 for (int i = src_rdma_head, num_tokens_sent = 0; i < src_rdma_tail; ++ i) { // line 830
     auto rdma_slot_idx = i % num_max_rdma_chunked_recv_tokens;
     void* shifted = rdma_channel_data.recv_buffer(src_rdma_rank) + rdma_slot_idx * num_bytes_per_rdma_token;
@@ -1149,7 +1164,7 @@ for (int i = src_rdma_head, num_tokens_sent = 0; i < src_rdma_tail; ++ i) { // l
 
 在处理完这个批次后， line 889更新共享缓存forward\_channel\_head用于后续kForwarderCoordinator更新， line 894更新全局显存nvl\_channel\_tail用于后续kNVLReceivers消费。 forward\_channel\_head和nvl\_channel\_tail存储的差异导致他们使用内存一致性上指令的差异。
 
-```text
+```cpp
 if (lane_id == src_rdma_rank)//line 888
     forward_channel_head[dst_nvl_rank][src_rdma_rank] = (cached_rdma_channel_head = src_rdma_tail);
 // forward_channel_head 是共享缓存
@@ -1162,13 +1177,13 @@ if (lane_id == 0) // 893
 
 至此kRDMAAndNVLForwarder的功能完成。**kRDMAAndNVLForwarder在有可用ipc nvl 缓存slot的情况下，会立刻消费， 填充速度受到kNVLReceivers消费速度的限制**。
 
-### kForwarderCoordinator， 确认rdma接受缓存被kRDMAAndNVLForwarder消费
+### 3.4 kForwarderCoordinator， 确认rdma接受缓存被kRDMAAndNVLForwarder消费
 
 line 901-935完成kForwarderCoordinator功能，kForwarderCoordinator的主要功能是基于kRDMAAndNVLForwarder的消费进度，通过rdma消息通知/控制kRDMASender的填充速度。
 
 kRDMAAndNVLForwarder的target\_rank在图10 sm/warp功能划分有描述。target rank 大于0的会马上推出，因此只有warp 8 会保留下来， warp9-warp15马上退出
 
-```text
+```cpp
 if (target_rank > 0) //line 903
    return;
 ```
@@ -1179,7 +1194,7 @@ kForwarderCoordinator在kRDMAAndNVLForwarder没有结束的情况下，汇报更
 
 line 912-916初始化共享缓存。
 
-```text
+```cpp
 for (int i = lane_id; i < kNumRDMARanks * NUM_MAX_NVL_PEERS; i += 32) //只有一个warp
    forward_channel_head[i % NUM_MAX_NVL_PEERS][i / NUM_MAX_NVL_PEERS] = 0; //消费进展
 if (lane_id < NUM_MAX_NVL_PEERS)
@@ -1189,7 +1204,7 @@ sync_forwarder_smem();
 
 line 923 - 931 更新信息。 forward\_channel\_head会被kRDMAAndNVLForwarder更新，并且只有线程0-7参与信息更新。
 
-```text
+```cpp
 for (int i = 0; i < NUM_MAX_NVL_PEERS; ++ i) if (not forward_channel_retired[i])
     min_head = min(min_head, forward_channel_head[i][target_rdma]);
 if (__all_sync(0xffffffff, min_head == std::numeric_limits<int>::max()))
@@ -1203,13 +1218,13 @@ if (min_head != std::numeric_limits<int>::max() and min_head > last_head and lan
 
 至此，kForwarderCoordinator完成主要功能，**kForwarderCoordinator主要就在于通过nvshmem\_uint64\_p通知远端kRDMASender消费进度。**
 
-### kNVLReceivers， 使用nvl缓存填充recv\_x
+### 3.5 kNVLReceivers， 使用nvl缓存填充recv\_x
 
 line939 - 1037完成kNVLReceivers功能， kNVLReceivers主要是从nvl 缓存中读取数据填充到recv\_x中去。
 
 line 941 - 962 用来记录从各rdma rank接受的信息
 
-```text
+```cpp
 while (lane_id < kNumRDMARanks) { //line 941
    start_offset = ld_volatile_global(nvl_channel_prefix_start.buffer() + lane_id);
    end_offset = ld_volatile_global(nvl_channel_prefix_end.buffer() + lane_id);
@@ -1224,7 +1239,7 @@ while (lane_id < kNumRDMARanks) { //line 941
 
 在line 963 得到总共要接受的token数
 
-```text
+```cpp
 num_tokens_to_recv = warp_reduce_sum(end_offset - start_offset);
 ```
 
@@ -1232,7 +1247,7 @@ line 971 - 1027 是填充num\_tokens\_to\_recv个token
 
 line 973 - 977是等待nvl缓存有数据
 
-```text
+```cpp
 while (lane_id == 0) {
     // Ready to copy
     if (cached_channel_head_idx != cached_channel_tail_idx)
@@ -1242,7 +1257,7 @@ while (lane_id == 0) {
 
 line 993开始填充可用的 nvl buffer 块
 
-```text
+```cpp
 for (int chunk_idx = 0; chunk_idx < num_recv_tokens; ++ chunk_idx, -- num_tokens_to_recv) {
     int token_idx_in_buffer = (cached_channel_head_idx ++) % num_max_nvl_chunked_recv_tokens;
     auto meta = ld_nc_global(nvl_channel_src_meta.buffer() + token_idx_in_buffer);
@@ -1254,14 +1269,14 @@ for (int chunk_idx = 0; chunk_idx < num_recv_tokens; ++ chunk_idx, -- num_tokens
 
 line 1026 -1027 是更新nvl缓存消费情况
 
-```text
+```cpp
 if (lane_id == 0)
   st_relaxed_sys_global(nvl_channel_head.buffer(), cached_channel_head_idx);
 ```
 
 至此， kNVLReceivers完成其主要功能。 **kNVLReceivers主要在于从nvl缓存复制数据到recv\_x上。**kNVLReceivers相对来说比较简单，所用到的同步/索引技巧在上文有阐述，主要复杂度反而是对数据结构的操作。 因为数据结构在上文也有较多描述，因此在本节点中主要描述其主要功能逻辑。
 
-## 总结
+## 4 总结
 
 本文主要描述了deepep中internode dispatch的代码逻辑。internode dispatch用到了ipc memory和nvshmem通信机制。这两种单向通信机制的使用，因为减少了节点之间的同步需求， 某种程度上带来了更高的通信效率，但同时也带来了更高的理解成本。代码中构建了大量的数据结构用于维持token，通信进展，控制缓存填充速度， 再加上叠加了cuda的并发特性，应用了ptx指令用于内存一致性和穿透cache， 使得整个代码成本较高。本文开始提出的分配20个sm用于通信，为了减小延迟会在rdma收到信息后马上通过nvlink发送到对应的专家上，以及使用了ptx指令来穿透L2缓存这些技巧，以及过程中的数据结构，同步逻辑在本文梳理过程中有一定解释。
 
